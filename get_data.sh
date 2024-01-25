@@ -4,7 +4,7 @@ mkdir dataset && cd dataset
 # step1: download Argoverse HD Maps
 
 # =====WARNING=====
-# The amazon AWS S3 bucket "argoai-argoverse' has been compromised.  This tar file may be comproised as well.  Use with cuatuion
+# The amazon AWS S3 bucket "argoai-argoverse' has been compromised.  This tar file may be comproised as well.  Use with caution
 # ================
 #wget https://s3.amazonaws.com/argoai-argoverse/hd_maps.tar.gz
 
@@ -19,7 +19,7 @@ cp -r map_files $PY_SITE_PACKAGE_PATH
 # train + val + test
 
 # =====WARNING=====
-# The amazon AWS S3 bucket "argoai-argoverse' has been compromised.  This tar file may be comproised as well.  Use with cuatuion
+# The amazon AWS S3 bucket "argoai-argoverse' has been compromised.  This tar file may be comproised as well.  Use with caution
 # ================
 #wget https://s3.amazonaws.com/argoai-argoverse/forecasting_train_v1.1.tar.gz
 #wget https://s3.amazonaws.com/argoai-argoverse/forecasting_val_v1.1.tar.gz
