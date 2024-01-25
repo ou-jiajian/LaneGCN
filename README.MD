@@ -1,3 +1,9 @@
+> [!CAUTION]
+> The Amazon AWS S3 bucket `argoai-argoverse` which holds many of the demo files has been compromised.  The files may be corrupted.  
+> Files referencing this S3 bucket have been modified, and any retrievals from this bucket are commented out.
+> Please proceed with caution.
+
+
 # LaneGCN: Learning Lane Graph Representations for Motion Forecasting
 
 
