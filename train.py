@@ -20,19 +20,21 @@ from numbers import Number
 from tqdm import tqdm
 import torch
 from torch.utils.data import Sampler, DataLoader
-import horovod.torch as hvd
-
+try:
+    import horovod.torch as hvd
+    from mpi4py import MPI
+    USE_HOROVOD = True
+    comm = MPI.COMM_WORLD
+    hvd.init()
+    torch.cuda.set_device(hvd.local_rank())
+except ImportError:
+    USE_HOROVOD = False
+    comm = None
+    print("Horovod not available, using single GPU training")
 
 from torch.utils.data.distributed import DistributedSampler
 
 from utils import Logger, load_pretrain
-
-from mpi4py import MPI
-
-
-comm = MPI.COMM_WORLD
-hvd.init()
-torch.cuda.set_device(hvd.local_rank())
 
 root_path = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, root_path)
@@ -52,7 +54,10 @@ parser.add_argument(
 
 
 def main():
-    seed = hvd.rank()
+    if USE_HOROVOD:
+        seed = hvd.rank()
+    else:
+        seed = 0
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     np.random.seed(seed)
@@ -63,7 +68,7 @@ def main():
     model = import_module(args.model)
     config, Dataset, collate_fn, net, loss, post_process, opt = model.get_model()
 
-    if config["horovod"]:
+    if config["horovod"] and USE_HOROVOD:
         opt.opt = hvd.DistributedOptimizer(
             opt.opt, named_parameters=net.named_parameters()
         )
@@ -82,7 +87,7 @@ def main():
         # Data loader for evaluation
         dataset = Dataset(config["val_split"], config, train=False)
         val_sampler = DistributedSampler(
-            dataset, num_replicas=hvd.size(), rank=hvd.rank()
+            dataset, num_replicas=hvd.size() if USE_HOROVOD else 1, rank=hvd.rank() if USE_HOROVOD else 0
         )
         val_loader = DataLoader(
             dataset,
@@ -93,14 +98,15 @@ def main():
             pin_memory=True,
         )
 
-        hvd.broadcast_parameters(net.state_dict(), root_rank=0)
+        if USE_HOROVOD:
+            hvd.broadcast_parameters(net.state_dict(), root_rank=0)
         val(config, val_loader, net, loss, post_process, 999)
         return
 
     # Create log and copy all code
     save_dir = config["save_dir"]
     log = os.path.join(save_dir, "log")
-    if hvd.rank() == 0:
+    if not USE_HOROVOD or hvd.rank() == 0:
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
         sys.stdout = Logger(log)
@@ -117,7 +123,7 @@ def main():
     # Data loader for training
     dataset = Dataset(config["train_split"], config, train=True)
     train_sampler = DistributedSampler(
-        dataset, num_replicas=hvd.size(), rank=hvd.rank()
+        dataset, num_replicas=hvd.size() if USE_HOROVOD else 1, rank=hvd.rank() if USE_HOROVOD else 0
     )
     train_loader = DataLoader(
         dataset,
@@ -132,7 +138,7 @@ def main():
 
     # Data loader for evaluation
     dataset = Dataset(config["val_split"], config, train=False)
-    val_sampler = DistributedSampler(dataset, num_replicas=hvd.size(), rank=hvd.rank())
+    val_sampler = DistributedSampler(dataset, num_replicas=hvd.size() if USE_HOROVOD else 1, rank=hvd.rank() if USE_HOROVOD else 0)
     val_loader = DataLoader(
         dataset,
         batch_size=config["val_batch_size"],
@@ -142,8 +148,9 @@ def main():
         pin_memory=True,
     )
 
-    hvd.broadcast_parameters(net.state_dict(), root_rank=0)
-    hvd.broadcast_optimizer_state(opt.opt, root_rank=0)
+    if USE_HOROVOD:
+        hvd.broadcast_parameters(net.state_dict(), root_rank=0)
+        hvd.broadcast_optimizer_state(opt.opt, root_rank=0)
 
     epoch = config["epoch"]
     remaining_epochs = int(np.ceil(config["num_epochs"] - epoch))
@@ -152,7 +159,7 @@ def main():
 
 
 def worker_init_fn(pid):
-    np_seed = hvd.rank() * 1024 + int(pid)
+    np_seed = (hvd.rank() if USE_HOROVOD else 0) * 1024 + int(pid)
     np.random.seed(np_seed)
     random_seed = np.random.randint(2 ** 32 - 1)
     random.seed(random_seed)
@@ -166,13 +173,13 @@ def train(epoch, config, train_loader, net, loss, post_process, opt, val_loader=
     epoch_per_batch = 1.0 / num_batches
     save_iters = int(np.ceil(config["save_freq"] * num_batches))
     display_iters = int(
-        config["display_iters"] / (hvd.size() * config["batch_size"])
+        config["display_iters"] / ((hvd.size() if USE_HOROVOD else 1) * config["batch_size"])
     )
-    val_iters = int(config["val_iters"] / (hvd.size() * config["batch_size"]))
+    val_iters = int(config["val_iters"] / ((hvd.size() if USE_HOROVOD else 1) * config["batch_size"]))
 
     start_time = time.time()
     metrics = dict()
-    for i, data in tqdm(enumerate(train_loader),disable=hvd.rank()):
+    for i, data in tqdm(enumerate(train_loader), disable=(USE_HOROVOD and hvd.rank() != 0)):
         epoch += epoch_per_batch
         data = dict(data)
 
@@ -186,7 +193,7 @@ def train(epoch, config, train_loader, net, loss, post_process, opt, val_loader=
         lr = opt.step(epoch)
 
         num_iters = int(np.round(epoch * num_batches))
-        if hvd.rank() == 0 and (
+        if (not USE_HOROVOD or hvd.rank() == 0) and (
             num_iters % save_iters == 0 or epoch >= config["num_epochs"]
         ):
             save_ckpt(net, opt, config["save_dir"], epoch)
@@ -194,7 +201,7 @@ def train(epoch, config, train_loader, net, loss, post_process, opt, val_loader=
         if num_iters % display_iters == 0:
             dt = time.time() - start_time
             metrics = sync(metrics)
-            if hvd.rank() == 0:
+            if not USE_HOROVOD or hvd.rank() == 0:
                 post_process.display(metrics, dt, epoch, lr)
             start_time = time.time()
             metrics = dict()
@@ -222,7 +229,7 @@ def val(config, data_loader, net, loss, post_process, epoch):
 
     dt = time.time() - start_time
     metrics = sync(metrics)
-    if hvd.rank() == 0:
+    if not USE_HOROVOD or hvd.rank() == 0:
         post_process.display(metrics, dt, epoch)
     net.train()
 
@@ -243,16 +250,20 @@ def save_ckpt(net, opt, save_dir, epoch):
 
 
 def sync(data):
-    data_list = comm.allgather(data)
-    data = dict()
-    for key in data_list[0]:
-        if isinstance(data_list[0][key], list):
-            data[key] = []
-        else:
-            data[key] = 0
-        for i in range(len(data_list)):
-            data[key] += data_list[i][key]
-    return data
+    if USE_HOROVOD and comm is not None:
+        data_list = comm.allgather(data)
+        synced_data = dict()
+        for key in data_list[0]:
+            if isinstance(data_list[0][key], list):
+                synced_data[key] = []
+            else:
+                synced_data[key] = 0
+            for i in range(len(data_list)):
+                synced_data[key] += data_list[i][key]
+        return synced_data
+    else:
+        # 单GPU情况下，直接返回原数据
+        return data
 
 
 if __name__ == "__main__":
